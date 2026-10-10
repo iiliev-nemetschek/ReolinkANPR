@@ -1,0 +1,8 @@
+.git
+config.yaml
+config/
+data/
+logs/
+screenshots/
+venv/
+__pycache__/

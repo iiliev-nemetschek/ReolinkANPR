@@ -22,6 +22,7 @@ logs/
 
 # Configuration (contains sensitive info)
 config.yaml
+config/
 
 # IDE & Editors
 .vscode/

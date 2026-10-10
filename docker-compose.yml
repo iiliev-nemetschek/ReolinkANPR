@@ -1,0 +1,17 @@
+services:
+  reolink-anpr:
+    build: .
+    container_name: reolink-anpr
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      TZ: Europe/Sofia
+    volumes:
+      - ./config:/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - model-cache:/root/.cache
+
+volumes:
+  model-cache:

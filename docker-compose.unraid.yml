@@ -1,0 +1,17 @@
+# Unraid variant: persistent data lives under /mnt/user/appdata (array/cache share),
+# not in docker.img. Run from the cloned repo directory:
+#   docker compose -f docker-compose.unraid.yml up -d --build
+services:
+  reolink-anpr:
+    build: .
+    container_name: reolink-anpr
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      TZ: Europe/Sofia
+    volumes:
+      - /mnt/user/appdata/reolink-anpr/config:/config
+      - /mnt/user/appdata/reolink-anpr/data:/app/data
+      - /mnt/user/appdata/reolink-anpr/logs:/app/logs
+      - /mnt/user/appdata/reolink-anpr/cache:/root/.cache
