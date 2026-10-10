@@ -71,6 +71,35 @@ def run_async(coro):
     return future.result(timeout=10)
 
 
+async def ensure_camera_client():
+    """Return a connected camera client built from the current config.yaml.
+
+    The config is re-read on every call so credentials saved from the web UI
+    take effect without restarting, and a failed/stale connection is retried.
+    """
+    global camera_client
+
+    fresh = Config("config.yaml")
+    if camera_client is not None:
+        old = camera_client.config
+        unchanged = (
+            old.camera_host == fresh.camera_host
+            and old.camera_username == fresh.camera_username
+            and old.camera_password == fresh.camera_password
+            and old.camera_channel == fresh.camera_channel
+        )
+        if unchanged and camera_client.connected:
+            return camera_client
+        try:
+            await camera_client.disconnect()
+        except Exception:
+            pass
+
+    camera_client = CameraClient(fresh)
+    await camera_client.connect()
+    return camera_client
+
+
 @app.route('/')
 def index():
     """Main dashboard page."""
@@ -196,17 +225,9 @@ def api_test_notifications():
 @app.route('/api/camera/rtsp/status', methods=['GET'])
 def api_rtsp_status():
     """Get RTSP status."""
-    global camera_client
-    
     async def get_status():
-        global camera_client
-        
-        # Initialize camera client if needed
-        if camera_client is None:
-            camera_client = CameraClient(config)
-            await camera_client.connect()
-        
         try:
+            camera_client = await ensure_camera_client()
             body = [{"cmd": "GetNetPort", "action": 0, "param": {"channel": 0}}]
             response = await camera_client.host.send(body)
             
@@ -233,17 +254,9 @@ def api_rtsp_status():
 @app.route('/api/camera/rtsp/toggle', methods=['POST'])
 def api_rtsp_toggle():
     """Toggle RTSP on/off."""
-    global camera_client
-    
     async def toggle_rtsp():
-        global camera_client
-        
-        # Initialize camera client if needed
-        if camera_client is None:
-            camera_client = CameraClient(config)
-            await camera_client.connect()
-        
         try:
+            camera_client = await ensure_camera_client()
             data = request.json
             enable = data.get('enable', True)
             
@@ -279,16 +292,10 @@ def api_rtsp_toggle():
 @app.route('/api/camera/settings', methods=['GET'])
 def get_camera_settings():
     """Get current camera ISP settings."""
-    global camera_client
-
     try:
         with camera_client_lock:
-            # Create camera client if needed
-            if camera_client is None:
-                camera_client = CameraClient(config)
-                run_async(camera_client.connect())
-
-            settings = run_async(camera_client.get_isp_settings())
+            client = run_async(ensure_camera_client())
+            settings = run_async(client.get_isp_settings())
 
         if settings:
             return jsonify({'success': True, 'settings': settings})
@@ -305,19 +312,13 @@ def get_camera_settings():
 @app.route('/api/camera/settings', methods=['POST'])
 def set_camera_settings():
     """Set camera ISP settings."""
-    global camera_client
-
     try:
         settings = request.json
         print(f"Received settings to apply: {settings}")
 
         with camera_client_lock:
-            # Create camera client if needed
-            if camera_client is None:
-                camera_client = CameraClient(config)
-                run_async(camera_client.connect())
-
-            success = run_async(camera_client.set_isp_settings(settings))
+            client = run_async(ensure_camera_client())
+            success = run_async(client.set_isp_settings(settings))
 
         if success:
             return jsonify({'success': True, 'message': 'Camera settings applied'})
