@@ -274,7 +274,7 @@ class ANPRService:
         try:
             # Process frames with ALPR
             save_dir = Path(self.config.database_path).parent
-            result = self.alpr.process_frames(frames, save_dir)
+            result = await asyncio.to_thread(self.alpr.process_frames, frames, save_dir)
 
             if result:
                 # Valid plate detected

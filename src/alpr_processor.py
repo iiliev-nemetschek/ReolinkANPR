@@ -16,6 +16,11 @@ except ImportError:
     logger.error("fast-alpr not available! Install with: pip install fast-alpr")
 
 
+# Stop scanning frames once the same plate is read this many times at this confidence
+EARLY_EXIT_CONFIDENCE = 0.95
+EARLY_EXIT_MATCHES = 3
+
+
 class ALPRProcessor:
     """Process images for license plate recognition using FastALPR."""
 
@@ -59,6 +64,7 @@ class ALPRProcessor:
         best_confidence = 0.0
         best_image = None
         best_plate_crop = None
+        confident_hits: Dict[str, int] = {}
 
         for i, frame_bytes in enumerate(frame_bytes_list):
             try:
@@ -122,6 +128,13 @@ class ALPRProcessor:
                         x1, y1 = int(bbox.x1), int(bbox.y1)
                         x2, y2 = int(bbox.x2), int(bbox.y2)
                         best_plate_crop = img[y1:y2, x1:x2].copy()
+
+                    if ocr_confidence >= EARLY_EXIT_CONFIDENCE:
+                        confident_hits[plate_text] = confident_hits.get(plate_text, 0) + 1
+
+                if confident_hits and max(confident_hits.values()) >= EARLY_EXIT_MATCHES:
+                    logger.info(f"Stopping early at frame {i+1}: plate read consistently")
+                    break
 
             except Exception as e:
                 logger.error(f"Error processing frame {i+1}: {e}")

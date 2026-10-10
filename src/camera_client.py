@@ -1,6 +1,7 @@
 """Reolink camera client with ANPR capabilities."""
 
 import asyncio
+import re
 import time
 import cv2
 import numpy as np
@@ -235,6 +236,12 @@ class CameraClient:
             logger.error(f"Error applying {mode}-recording settings: {e}")
             return False
 
+    def _mask_credentials(self, text: str) -> str:
+        """Hide the camera password in text destined for logs (e.g. FFmpeg's RTSP URL echo)."""
+        text = re.sub(r"(rtsp://[^:/@\s]+:)[^@\s]*@", r"\1***@", text)
+        password = self.config.camera_password
+        return text.replace(password, "***") if password else text
+
     async def _record_rtsp_and_extract_frames(self, duration_seconds: int = 6) -> List[bytes]:
         """Record RTSP stream for specified duration and extract all frames."""
         from pathlib import Path
@@ -277,15 +284,16 @@ class CameraClient:
             )
 
             stdout, stderr = await process.communicate()
+            ffmpeg_output = self._mask_credentials(stderr.decode(errors="replace"))
 
             if process.returncode != 0:
                 logger.error(f"FFmpeg recording failed (return code {process.returncode})")
-                logger.error(f"FFmpeg stderr: {stderr.decode()}")
+                logger.error(f"FFmpeg stderr: {ffmpeg_output}")
                 return []
 
             # Log FFmpeg output even on success (for debugging)
             if stderr:
-                logger.debug(f"FFmpeg stderr: {stderr.decode()}")
+                logger.debug(f"FFmpeg stderr: {ffmpeg_output}")
 
             if not recording_file.exists():
                 logger.error("Recording file was not created")
