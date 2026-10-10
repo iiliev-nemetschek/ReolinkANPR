@@ -87,8 +87,10 @@ class ALPRProcessor:
 
                 # Process each detection
                 for result in results:
+                    if result.ocr is None:
+                        continue
                     plate_text = result.ocr.text.upper().replace(' ', '')
-                    ocr_confidence = result.ocr.confidence
+                    ocr_confidence = self._ocr_confidence(result.ocr)
                     detection_confidence = result.detection.confidence
 
                     # Check confidence threshold
@@ -102,10 +104,10 @@ class ALPRProcessor:
                     is_better = False
                     if best_result is None:
                         is_better = True
-                    elif ocr_confidence > best_result.ocr.confidence:
+                    elif ocr_confidence > best_confidence:
                         # Higher OCR confidence always wins
                         is_better = True
-                    elif ocr_confidence == best_result.ocr.confidence:
+                    elif ocr_confidence == best_confidence:
                         # Same OCR confidence - use detection as tiebreaker
                         if detection_confidence > best_result.detection.confidence:
                             is_better = True
@@ -150,7 +152,7 @@ class ALPRProcessor:
 
             return {
                 'plate_number': best_result.ocr.text.upper().replace(' ', ''),
-                'confidence': best_result.ocr.confidence,
+                'confidence': best_confidence,
                 'image_path': f"images/{image_filename}",
                 'plate_crop_path': f"images/{crop_filename}",
                 'box_coordinates': {
@@ -164,6 +166,14 @@ class ALPRProcessor:
 
         logger.info("No valid plates detected in any frame")
         return None
+
+    @staticmethod
+    def _ocr_confidence(ocr) -> float:
+        """Newer fast-alpr returns per-character confidences; older returns one float."""
+        conf = ocr.confidence
+        if isinstance(conf, (list, tuple)):
+            return float(sum(conf) / len(conf)) if conf else 0.0
+        return float(conf)
 
     def _save_debug_frames(self, frame_bytes_list: List[bytes], save_dir: Path):
         """Save first and last frames for debugging when no plates detected."""
