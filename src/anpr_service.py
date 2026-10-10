@@ -181,8 +181,8 @@ class ANPRService:
         logger.info("Service running in configuration mode...")
         logger.info("Waiting for configuration via web interface")
 
-        while self.running:
-            await asyncio.sleep(60)
+        # Saving the config from the web UI drops a reload signal; apply it here
+        await self._check_reload_signal()
 
     async def _check_reload_signal(self):
         """Check for reload signal file periodically."""
