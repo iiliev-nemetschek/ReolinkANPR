@@ -87,6 +87,12 @@ class Config:
     def recording_duration(self) -> int:
         return self.get('camera', 'recording_duration') or 6
 
+    @property
+    def persistent_stream(self) -> bool:
+        """Keep the RTSP stream open between detections (on unless explicitly turned off)."""
+        value = self.get('camera', 'persistent_stream')
+        return True if value is None else bool(value)
+
     # ALPR settings
     @property
     def detector_model(self) -> str:

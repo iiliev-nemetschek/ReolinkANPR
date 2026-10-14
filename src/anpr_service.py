@@ -96,6 +96,7 @@ class ANPRService:
 
             # Set up event-driven processing callback
             self.camera.set_processing_callback(self._handle_vehicle_detection)
+            self.camera.start_stream()
 
             # Start monitoring
             self.running = True
@@ -138,6 +139,7 @@ class ANPRService:
                 logger.info("✓ Reconnected to camera with new settings")
                 # Re-set the processing callback
                 self.camera.set_processing_callback(self._handle_vehicle_detection)
+                self.camera.start_stream()
             else:
                 logger.error("✗ Failed to reconnect to camera")
                 return False

@@ -36,6 +36,9 @@ camera:
   # (scanning stops as soon as the plate is read consistently)
   recording_duration: 5
 
+  # Keep the RTSP stream open between detections so plate reading never waits for
+  # the camera to connect (costs constant CPU). false = connect only on detection.
+  persistent_stream: true
 # Optional: Recording Settings
 # Automatically change camera ISP settings during recording
 recording:

@@ -1,8 +1,11 @@
 """Reolink camera client with ANPR capabilities."""
 
 import asyncio
+import math
 import re
 import time
+from collections import deque
+from contextlib import aclosing
 import cv2
 import numpy as np
 from pathlib import Path
@@ -11,8 +14,11 @@ from reolink_aio.api import Host
 from .logger import logger
 
 # RTSP frame streaming for ANPR
-STREAM_FPS = 8  # Frames per second handed to ALPR (the camera itself sends ~25)
-STREAM_CONNECT_TIMEOUT = 8  # Seconds to wait for the first frame
+STREAM_FPS = 5  # Frames per second kept from the camera's ~25; ALPR can't keep up with more
+PRE_TRIGGER_SECONDS = 2.0  # Frames from this long before a detection are still scanned
+STREAM_CONNECT_TIMEOUT = 8  # Seconds a scan waits for its first frame when nothing is buffered
+STREAM_STALL_TIMEOUT = 15  # Reconnect if the stream delivers no data for this long
+KEEPALIVE_SECONDS = 5  # The first camera API call after ~20s of silence takes 1-2s; poll to keep it fast
 
 
 class CameraClient:
@@ -30,6 +36,12 @@ class CameraClient:
         self.last_processed_time = 0
         self.is_processing = False
 
+        # Persistent RTSP stream (see start_stream)
+        self._stream_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._frames = deque(maxlen=math.ceil(STREAM_FPS * PRE_TRIGGER_SECONDS) + 2)  # (monotonic time, JPEG)
+        self._frame_seq = 0
+        self._frame_event = asyncio.Event()
     async def connect(self) -> bool:
         """Connect to Reolink camera."""
         try:
@@ -135,6 +147,8 @@ class CameraClient:
 
     async def disconnect(self):
         """Disconnect from camera."""
+        await self.stop_stream()
+
         if self.host and self.connected:
             try:
                 await self.host.baichuan.unsubscribe_events()
@@ -247,17 +261,52 @@ class CameraClient:
         password = self.config.camera_password
         return text.replace(password, "***") if password else text
 
-    async def stream_frames(self, duration_seconds: float) -> AsyncIterator[bytes]:
-        """Yield JPEG frames straight from the RTSP stream, always the newest one.
+    def start_stream(self):
+        """Keep one RTSP connection open and buffer recent frames (persistent stream option).
 
-        Frames that arrive while the consumer is busy are dropped, so processing never
-        works on stale images. The scan window starts at the first frame and lasts
-        duration_seconds; closing the iterator (e.g. on early exit) stops ffmpeg.
+        The camera needs several seconds to hand out a first frame on a fresh connection,
+        so a detection must never wait for one: it scans the buffer and live frames instead.
+        Also starts a light API poll so the AI-state check at detection time isn't a cold call.
+        Does nothing when the persistent stream is turned off in the config.
         """
+        if not self.config.persistent_stream:
+            return
+        self._start_ffmpeg()
+        if self._keepalive_task is None or self._keepalive_task.done():
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    def _start_ffmpeg(self):
+        if self._stream_task is None or self._stream_task.done():
+            self._stream_task = asyncio.create_task(self._stream_supervisor())
+
+    async def _stop_ffmpeg(self):
+        task, self._stream_task = self._stream_task, None
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._frames.clear()
+
+    async def stop_stream(self):
+        task, self._keepalive_task = self._keepalive_task, None
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._stop_ffmpeg()
+
+    async def _keepalive_loop(self):
+        while True:
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+            try:
+                await self.host.get_ai_state(self.config.camera_channel)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Keepalive failed: {e}")
+
+    def _ffmpeg_stream_cmd(self) -> List[str]:
         # Reolink uses 1-based channel numbering
         rtsp_url = f"rtsp://{self.config.camera_username}:{self.config.camera_password}@{self.config.camera_host}:554/h264Preview_{self.config.camera_channel+1:02d}_main"
-
-        ffmpeg_cmd = [
+        return [
             'ffmpeg', '-hide_banner', '-loglevel', 'error',
             '-rtsp_transport', 'tcp',
             '-fflags', 'nobuffer', '-flags', 'low_delay',  # Don't wait to fill input buffers
@@ -269,79 +318,128 @@ class CameraClient:
             '-f', 'image2pipe', 'pipe:1',
         ]
 
+    async def _stream_supervisor(self):
+        """Run the ffmpeg stream forever, reconnecting with backoff when it drops."""
+        backoff = 1
+        while True:
+            started = time.monotonic()
+            try:
+                error = await self._run_stream()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                error = self._mask_credentials(str(e))
+
+            logger.warning(f"RTSP stream ended ({error or 'no error output'}); reconnecting in {backoff}s")
+            if time.monotonic() - started > 60:
+                backoff = 1
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    async def _run_stream(self) -> str:
+        """Read one ffmpeg session into the frame buffer. Returns ffmpeg's error output."""
         started = time.monotonic()
         process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
+            *self._ffmpeg_stream_cmd(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
-        latest: Optional[bytes] = None
-        new_frame = asyncio.Event()
-        finished = False
-        stderr_chunks: List[bytes] = []
-
-        async def read_frames():
-            nonlocal latest, finished
-            buffer = bytearray()
-            try:
-                while True:
-                    chunk = await process.stdout.read(262144)
-                    if not chunk:
-                        break
-                    buffer += chunk
-                    # Each JPEG starts with FFD8 and ends with FFD9
-                    while True:
-                        start = buffer.find(b'\xff\xd8')
-                        end = buffer.find(b'\xff\xd9', start + 2) if start >= 0 else -1
-                        if start < 0 or end < 0:
-                            break
-                        latest = bytes(buffer[start:end + 2])
-                        del buffer[:end + 2]
-                        new_frame.set()
-            finally:
-                finished = True
-                new_frame.set()
-
-        async def read_stderr():
-            data = await process.stderr.read()
-            if data:
-                stderr_chunks.append(data)
-
-        reader = asyncio.create_task(read_frames())
-        stderr_reader = asyncio.create_task(read_stderr())
+        stderr_reader = asyncio.create_task(process.stderr.read())
+        buffer = bytearray()
+        connected = False
+        stalled = False
 
         try:
-            deadline = started + STREAM_CONNECT_TIMEOUT
-            first_frame_at = None
             while True:
-                if first_frame_at is not None and time.monotonic() >= deadline:
+                chunk = await asyncio.wait_for(process.stdout.read(262144), timeout=STREAM_STALL_TIMEOUT)
+                if not chunk:
                     break
-                try:
-                    await asyncio.wait_for(new_frame.wait(), timeout=max(deadline - time.monotonic(), 0.01))
-                except asyncio.TimeoutError:
-                    if first_frame_at is None:
-                        logger.error(f"No frame from RTSP stream within {STREAM_CONNECT_TIMEOUT}s")
-                    break
-                new_frame.clear()
-                if latest is None:
-                    if finished:
-                        break  # ffmpeg exited and everything was consumed
-                    continue
-
-                frame, latest = latest, None
-                if first_frame_at is None:
-                    first_frame_at = time.monotonic()
-                    deadline = first_frame_at + duration_seconds
-                    logger.info(f"First RTSP frame after {first_frame_at - started:.2f}s")
-                yield frame
+                buffer += chunk
+                # Each JPEG starts with FFD8 and ends with FFD9
+                while True:
+                    start = buffer.find(b'\xff\xd8')
+                    end = buffer.find(b'\xff\xd9', start + 2) if start >= 0 else -1
+                    if start < 0 or end < 0:
+                        break
+                    self._frames.append((time.monotonic(), bytes(buffer[start:end + 2])))
+                    del buffer[:end + 2]
+                    self._frame_seq += 1
+                    self._frame_event.set()
+                    if not connected:
+                        connected = True
+                        logger.info(f"RTSP stream connected - first frame after {time.monotonic() - started:.2f}s")
+        except asyncio.TimeoutError:
+            stalled = True
         finally:
             if process.returncode is None:
                 process.kill()
             await process.wait()
-            await asyncio.gather(reader, stderr_reader, return_exceptions=True)
-            if stderr_chunks and first_frame_at is None:
-                logger.error(f"FFmpeg stderr: {self._mask_credentials(stderr_chunks[0].decode(errors='replace'))}")
+            stderr = await stderr_reader
+
+        if stalled:
+            return f"no data for {STREAM_STALL_TIMEOUT}s"
+        return self._mask_credentials(stderr.decode(errors='replace').strip())
+
+    async def stream_frames(self, duration_seconds: float) -> AsyncIterator[bytes]:
+        """Yield frames for one scan.
+
+        With the persistent stream on, recent buffered frames come first, then live ones.
+        With it off, ffmpeg is started for this scan only and stopped when the scan ends.
+        """
+        on_demand = not self.config.persistent_stream
+        if on_demand:
+            self._start_ffmpeg()
+        else:
+            self.start_stream()  # No-op when the stream is already running
+
+        try:
+            async with aclosing(self._scan_frames(duration_seconds)) as frames:
+                async for frame in frames:
+                    yield frame
+        finally:
+            if on_demand:
+                await self._stop_ffmpeg()
+
+    async def _scan_frames(self, duration_seconds: float) -> AsyncIterator[bytes]:
+        """Buffered frames newest-first, then live ones.
+
+        Live frames that arrive while the consumer is busy are skipped, so processing never
+        falls behind. The scan lasts duration_seconds; if nothing is buffered it starts counting
+        at the first live frame (waiting up to STREAM_CONNECT_TIMEOUT for it).
+        """
+        started = time.monotonic()
+        buffered = [frame for taken, frame in reversed(self._frames) if started - taken <= PRE_TRIGGER_SECONDS]
+        last_seq = self._frame_seq
+        got_frame = bool(buffered)
+        deadline = started + (duration_seconds if buffered else STREAM_CONNECT_TIMEOUT)
+        logger.info(f"Scanning with {len(buffered)} buffered frames")
+
+        for frame in buffered:
+            if time.monotonic() >= deadline:
+                return
+            yield frame
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if not got_frame:
+                    logger.error(f"No frame from RTSP stream within {STREAM_CONNECT_TIMEOUT}s")
+                return
+
+            if self._frame_seq == last_seq:
+                self._frame_event.clear()
+                try:
+                    await asyncio.wait_for(self._frame_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            last_seq = self._frame_seq
+            if not got_frame:
+                got_frame = True
+                deadline = time.monotonic() + duration_seconds
+                logger.info(f"First live frame after {time.monotonic() - started:.2f}s")
+            yield self._frames[-1][1]
 
     async def get_snapshot(self) -> Optional[bytes]:
         """Get a single snapshot from the camera."""

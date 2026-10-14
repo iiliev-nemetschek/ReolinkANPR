@@ -93,6 +93,19 @@
                                         <span class="spinner-border spinner-border-sm me-2"></span>Checking status...
                                     </small>
                                 </div>
+                                <div class="col-md-6 mb-3">
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" id="persistent_stream">
+                                        <label class="form-check-label" for="persistent_stream">
+                                            Persistent RTSP stream
+                                        </label>
+                                    </div>
+                                    <small class="text-muted d-block mt-2">
+                                        Keeps the stream open so a detection doesn't wait several seconds for the camera to connect.
+                                        Costs constant CPU (the stream is decoded around the clock) and polls the camera every 5 seconds.
+                                        Off: connect only when a vehicle is detected.
+                                    </small>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -503,6 +516,7 @@
             document.getElementById('camera_password').value = config.camera?.password || '';
             document.getElementById('camera_channel').value = config.camera?.channel || 0;
             document.getElementById('recording_duration').value = config.camera?.recording_duration || 3;
+            document.getElementById('persistent_stream').checked = config.camera?.persistent_stream !== false;
 
             // ALPR settings
             document.getElementById('detection_model').value = config.alpr?.detection_model || 'yolo-v9-t-640-license-plate-end2end';
@@ -685,7 +699,8 @@
                 username: document.getElementById('camera_username').value,
                 password: document.getElementById('camera_password').value,
                 channel: parseInt(document.getElementById('camera_channel').value),
-                recording_duration: parseInt(document.getElementById('recording_duration').value)
+                recording_duration: parseInt(document.getElementById('recording_duration').value),
+                persistent_stream: document.getElementById('persistent_stream').checked
             },
             alpr: {
                 detection_model: document.getElementById('detection_model').value,
