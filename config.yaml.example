@@ -32,7 +32,8 @@ camera:
   username: admin
   password: CHANGE_ME
   
-  # Recording duration in seconds when vehicle detected
+  # Maximum seconds to keep reading the live stream after a vehicle is detected
+  # (scanning stops as soon as the plate is read consistently)
   recording_duration: 5
 
 # Optional: Recording Settings

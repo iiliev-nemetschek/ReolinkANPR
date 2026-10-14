@@ -6,9 +6,13 @@ import time
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 from reolink_aio.api import Host
 from .logger import logger
+
+# RTSP frame streaming for ANPR
+STREAM_FPS = 8  # Frames per second handed to ALPR (the camera itself sends ~25)
+STREAM_CONNECT_TIMEOUT = 8  # Seconds to wait for the first frame
 
 
 class CameraClient:
@@ -95,8 +99,9 @@ class CameraClient:
         """Check AI state and process if vehicle detected."""
         try:
             # Check AI state IMMEDIATELY to see if vehicle
+            ai_state_started = time.monotonic()
             ai_state = await self.host.get_ai_state(self.config.camera_channel)
-            logger.info(f"AI State: {ai_state}")
+            logger.info(f"AI State: {ai_state} (took {time.monotonic() - ai_state_started:.2f}s)")
 
             if ai_state and ai_state.get('vehicle') == True:
                 logger.info("VEHICLE motion confirmed via AI state!")
@@ -242,104 +247,101 @@ class CameraClient:
         password = self.config.camera_password
         return text.replace(password, "***") if password else text
 
-    async def _record_rtsp_and_extract_frames(self, duration_seconds: int = 6) -> List[bytes]:
-        """Record RTSP stream for specified duration and extract all frames."""
-        from pathlib import Path
-        import tempfile
-        import os
+    async def stream_frames(self, duration_seconds: float) -> AsyncIterator[bytes]:
+        """Yield JPEG frames straight from the RTSP stream, always the newest one.
 
-        frames = []
+        Frames that arrive while the consumer is busy are dropped, so processing never
+        works on stale images. The scan window starts at the first frame and lasts
+        duration_seconds; closing the iterator (e.g. on early exit) stops ffmpeg.
+        """
+        # Reolink uses 1-based channel numbering
+        rtsp_url = f"rtsp://{self.config.camera_username}:{self.config.camera_password}@{self.config.camera_host}:554/h264Preview_{self.config.camera_channel+1:02d}_main"
+
+        ffmpeg_cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-rtsp_transport', 'tcp',
+            '-fflags', 'nobuffer', '-flags', 'low_delay',  # Don't wait to fill input buffers
+            '-probesize', '32768', '-analyzeduration', '0',  # Skip long stream probing
+            '-i', rtsp_url,
+            '-an',
+            '-vf', f'fps={STREAM_FPS}',
+            '-c:v', 'mjpeg', '-q:v', '3',
+            '-f', 'image2pipe', 'pipe:1',
+        ]
+
+        started = time.monotonic()
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        latest: Optional[bytes] = None
+        new_frame = asyncio.Event()
+        finished = False
+        stderr_chunks: List[bytes] = []
+
+        async def read_frames():
+            nonlocal latest, finished
+            buffer = bytearray()
+            try:
+                while True:
+                    chunk = await process.stdout.read(262144)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    # Each JPEG starts with FFD8 and ends with FFD9
+                    while True:
+                        start = buffer.find(b'\xff\xd8')
+                        end = buffer.find(b'\xff\xd9', start + 2) if start >= 0 else -1
+                        if start < 0 or end < 0:
+                            break
+                        latest = bytes(buffer[start:end + 2])
+                        del buffer[:end + 2]
+                        new_frame.set()
+            finally:
+                finished = True
+                new_frame.set()
+
+        async def read_stderr():
+            data = await process.stderr.read()
+            if data:
+                stderr_chunks.append(data)
+
+        reader = asyncio.create_task(read_frames())
+        stderr_reader = asyncio.create_task(read_stderr())
 
         try:
-            # Create temporary directory for recording
-            temp_dir = Path(tempfile.gettempdir()) / "reolink_anpr_recordings"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-
-            # Generate temporary file
-            recording_file = temp_dir / f"recording_{int(time.time())}.mp4"
-
-            # Construct RTSP URL (Reolink uses 1-based channel numbering)
-            rtsp_url = f"rtsp://{self.config.camera_username}:{self.config.camera_password}@{self.config.camera_host}:554/h264Preview_{self.config.camera_channel+1:02d}_main"
-
-            logger.info(f"Recording RTSP stream for {duration_seconds} seconds...")
-
-            # FFmpeg command to record RTSP stream with input buffer
-            ffmpeg_cmd = [
-                'ffmpeg',
-                '-rtsp_transport', 'tcp',  # Use TCP for more reliable streaming
-                '-fflags', '+genpts',  # Generate presentation timestamps
-                '-i', rtsp_url,
-                '-t', str(duration_seconds),  # Record for specified duration
-                '-c:v', 'copy',  # Copy video codec (no re-encoding)
-                '-c:a', 'copy',  # Copy audio codec
-                '-y',  # Overwrite output file
-                str(recording_file)
-            ]
-
-            # Execute FFmpeg recording
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-            ffmpeg_output = self._mask_credentials(stderr.decode(errors="replace"))
-
-            if process.returncode != 0:
-                logger.error(f"FFmpeg recording failed (return code {process.returncode})")
-                logger.error(f"FFmpeg stderr: {ffmpeg_output}")
-                return []
-
-            # Log FFmpeg output even on success (for debugging)
-            if stderr:
-                logger.debug(f"FFmpeg stderr: {ffmpeg_output}")
-
-            if not recording_file.exists():
-                logger.error("Recording file was not created")
-                return []
-
-            logger.info(f"Recording complete: {recording_file.stat().st_size} bytes")
-
-            # Extract all frames from recording
-            logger.info("Extracting frames from recording...")
-
-            cap = cv2.VideoCapture(str(recording_file))
-
-            if not cap.isOpened():
-                logger.error(f"Failed to open recorded video file")
-                return []
-
-            # Get video properties
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            logger.info(f"Video info: {fps:.1f} FPS, {total_frames} total frames")
-
-            frame_count = 0
+            deadline = started + STREAM_CONNECT_TIMEOUT
+            first_frame_at = None
             while True:
-                ret, frame = cap.read()
-                if not ret:
+                if first_frame_at is not None and time.monotonic() >= deadline:
                     break
+                try:
+                    await asyncio.wait_for(new_frame.wait(), timeout=max(deadline - time.monotonic(), 0.01))
+                except asyncio.TimeoutError:
+                    if first_frame_at is None:
+                        logger.error(f"No frame from RTSP stream within {STREAM_CONNECT_TIMEOUT}s")
+                    break
+                new_frame.clear()
+                if latest is None:
+                    if finished:
+                        break  # ffmpeg exited and everything was consumed
+                    continue
 
-                # Convert frame to JPEG bytes
-                _, buffer = cv2.imencode('.jpg', frame)
-                frames.append(buffer.tobytes())
-                frame_count += 1
-
-            cap.release()
-
-            # Clean up recording file
-            try:
-                recording_file.unlink()
-            except Exception as e:
-                logger.warning(f"Failed to clean up recording file: {e}")
-
-            logger.info(f"Extracted {len(frames)} frames from {duration_seconds}s recording")
-            return frames
-
-        except Exception as e:
-            logger.error(f"Error recording RTSP stream: {e}")
-            return []
+                frame, latest = latest, None
+                if first_frame_at is None:
+                    first_frame_at = time.monotonic()
+                    deadline = first_frame_at + duration_seconds
+                    logger.info(f"First RTSP frame after {first_frame_at - started:.2f}s")
+                yield frame
+        finally:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            await asyncio.gather(reader, stderr_reader, return_exceptions=True)
+            if stderr_chunks and first_frame_at is None:
+                logger.error(f"FFmpeg stderr: {self._mask_credentials(stderr_chunks[0].decode(errors='replace'))}")
 
     async def get_snapshot(self) -> Optional[bytes]:
         """Get a single snapshot from the camera."""

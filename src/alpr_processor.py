@@ -17,6 +17,7 @@ except ImportError:
 
 
 # Stop scanning frames once the same plate is read this many times at this confidence
+# and no other plate string has as many reads
 EARLY_EXIT_CONFIDENCE = 0.95
 EARLY_EXIT_MATCHES = 3
 
@@ -39,146 +40,9 @@ class ALPRProcessor:
 
         logger.info(f"FastALPR initialized with {config.detector_model}")
 
-    def process_frames(
-        self,
-        frame_bytes_list: List[bytes],
-        save_dir: Path
-    ) -> Optional[Dict]:
-        """
-        Process multiple frames and return the best result.
-
-        Args:
-            frame_bytes_list: List of frame bytes to process
-            save_dir: Directory to save images
-
-        Returns:
-            Dict with plate info and paths, or None if no plate found
-        """
-        if not frame_bytes_list:
-            logger.warning("No frames provided for processing")
-            return None
-
-        logger.info(f"Processing {len(frame_bytes_list)} frames...")
-
-        best_result = None
-        best_confidence = 0.0
-        best_image = None
-        best_plate_crop = None
-        confident_hits: Dict[str, int] = {}
-
-        for i, frame_bytes in enumerate(frame_bytes_list):
-            try:
-                # Decode image
-                image_array = np.frombuffer(frame_bytes, np.uint8)
-                img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-
-                if img is None:
-                    logger.warning(f"Failed to decode frame {i+1}")
-                    continue
-
-                # Run detection-only first (lighter weight)
-                detections = self.alpr.detector.predict(img)
-
-                if not detections:
-                    if (i+1) % 20 == 0:  # Log every 20th frame to reduce noise
-                        logger.debug(f"Frame {i+1}: No plates detected")
-                    continue
-
-                # Run full ALPR (detection + OCR) on frames with detections
-                results = self.alpr.predict(img)
-
-                if not results:
-                    logger.debug(f"Frame {i+1}: Detected {len(detections)} plates but OCR failed")
-                    continue
-
-                # Process each detection
-                for result in results:
-                    if result.ocr is None:
-                        continue
-                    plate_text = result.ocr.text.upper().replace(' ', '')
-                    ocr_confidence = self._ocr_confidence(result.ocr)
-                    detection_confidence = result.detection.confidence
-
-                    # Check confidence threshold
-                    if ocr_confidence < self.config.min_confidence:
-                        logger.debug(f"Frame {i+1}: Low confidence {ocr_confidence:.3f} for {plate_text}")
-                        continue
-
-                    logger.info(f"Frame {i+1}: {plate_text} (confidence: {ocr_confidence:.3f})")
-
-                    # Track best result - OCR priority, detection as tiebreaker
-                    is_better = False
-                    if best_result is None:
-                        is_better = True
-                    elif ocr_confidence > best_confidence:
-                        # Higher OCR confidence always wins
-                        is_better = True
-                    elif ocr_confidence == best_confidence:
-                        # Same OCR confidence - use detection as tiebreaker
-                        if detection_confidence > best_result.detection.confidence:
-                            is_better = True
-                    
-                    if is_better:
-                        best_confidence = ocr_confidence
-                        best_result = result
-                        best_image = img.copy()
-
-                        # Crop plate region
-                        bbox = result.detection.bounding_box
-                        x1, y1 = int(bbox.x1), int(bbox.y1)
-                        x2, y2 = int(bbox.x2), int(bbox.y2)
-                        best_plate_crop = img[y1:y2, x1:x2].copy()
-
-                    if ocr_confidence >= EARLY_EXIT_CONFIDENCE:
-                        confident_hits[plate_text] = confident_hits.get(plate_text, 0) + 1
-
-                if confident_hits and max(confident_hits.values()) >= EARLY_EXIT_MATCHES:
-                    logger.info(f"Stopping early at frame {i+1}: plate read consistently")
-                    break
-
-            except Exception as e:
-                logger.error(f"Error processing frame {i+1}: {e}")
-                continue
-
-        # If no detections found, save debug frames
-        if not best_result:
-            logger.info("No valid plates detected - saving first and last frames for debugging")
-            self._save_debug_frames(frame_bytes_list, save_dir)
-
-        # Return best result if found
-        if best_result and best_image is not None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-            # Save full image
-            image_filename = f"{timestamp}_{best_result.ocr.text.upper().replace(' ', '')}.jpg"
-            image_path = save_dir / "images" / image_filename
-            image_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(image_path), best_image)
-
-            # Save plate crop
-            crop_filename = f"{timestamp}_{best_result.ocr.text.upper().replace(' ', '')}_crop.jpg"
-            crop_path = save_dir / "images" / crop_filename
-            if best_plate_crop is not None:
-                cv2.imwrite(str(crop_path), best_plate_crop)
-
-            bbox = best_result.detection.bounding_box
-
-            return {
-                'plate_number': best_result.ocr.text.upper().replace(' ', ''),
-                'confidence': best_confidence,
-                'image_path': f"images/{image_filename}",
-                'plate_crop_path': f"images/{crop_filename}",
-                'box_coordinates': {
-                    'xmin': bbox.x1,
-                    'ymin': bbox.y1,
-                    'xmax': bbox.x2,
-                    'ymax': bbox.y2
-                },
-                'frame_count': len(frame_bytes_list)
-            }
-
-        logger.info("No valid plates detected in any frame")
-        return None
+    def new_scan(self) -> "PlateScan":
+        """Start an incremental scan: feed frames one by one until it reports a confident plate."""
+        return PlateScan(self)
 
     @staticmethod
     def _ocr_confidence(ocr) -> float:
@@ -226,3 +90,130 @@ class ALPRProcessor:
 
         except Exception as e:
             logger.error(f"Failed to save debug frames: {e}")
+
+
+class _Candidate:
+    """Reads of one plate string accumulated over a scan."""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.hits = 0
+        self.confident_hits = 0
+        self.best_confidence = 0.0
+        self.best_detection_confidence = 0.0
+        self.image = None
+        self.crop = None
+        self.bbox = None
+
+    def rank(self) -> Tuple[int, float, float]:
+        # Majority vote first, then OCR confidence, then detection confidence
+        return (self.hits, self.best_confidence, self.best_detection_confidence)
+
+
+class PlateScan:
+    """Incremental ALPR over a stream of frames, with a majority vote across frames."""
+
+    def __init__(self, processor: ALPRProcessor):
+        self.processor = processor
+        self.min_confidence = processor.config.min_confidence
+        self.candidates: Dict[str, _Candidate] = {}
+        self.frames_seen = 0
+        self._first_frame: Optional[bytes] = None
+        self._last_frame: Optional[bytes] = None
+
+    def add_frame(self, frame_bytes: bytes) -> bool:
+        """Process one JPEG frame. Returns True once a plate is read consistently enough to stop."""
+        self.frames_seen += 1
+        n = self.frames_seen
+        if self._first_frame is None:
+            self._first_frame = frame_bytes
+        self._last_frame = frame_bytes
+
+        try:
+            img = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                logger.warning(f"Failed to decode frame {n}")
+                return False
+
+            for result in self.processor.alpr.predict(img):
+                if result.ocr is None:
+                    continue
+                text = result.ocr.text.upper().replace(' ', '')
+                confidence = self.processor._ocr_confidence(result.ocr)
+
+                if confidence < self.min_confidence:
+                    logger.debug(f"Frame {n}: Low confidence {confidence:.3f} for {text}")
+                    continue
+
+                logger.info(f"Frame {n}: {text} (confidence: {confidence:.3f})")
+                self._record(text, confidence, result, img)
+        except Exception as e:
+            logger.error(f"Error processing frame {n}: {e}")
+            return False
+
+        return self._is_consistent()
+
+    def _record(self, text: str, confidence: float, result, img):
+        cand = self.candidates.setdefault(text, _Candidate(text))
+        cand.hits += 1
+        if confidence >= EARLY_EXIT_CONFIDENCE:
+            cand.confident_hits += 1
+
+        detection_confidence = result.detection.confidence
+        if (confidence, detection_confidence) > (cand.best_confidence, cand.best_detection_confidence):
+            cand.best_confidence = confidence
+            cand.best_detection_confidence = detection_confidence
+            cand.image = img
+            bbox = result.detection.bounding_box
+            cand.bbox = bbox
+            cand.crop = img[int(bbox.y1):int(bbox.y2), int(bbox.x1):int(bbox.x2)].copy()
+
+    def _ranked(self) -> List[_Candidate]:
+        return sorted(self.candidates.values(), key=lambda c: c.rank(), reverse=True)
+
+    def _is_consistent(self) -> bool:
+        ranked = self._ranked()
+        if not ranked:
+            return False
+        leader = ranked[0]
+        runner_up_hits = ranked[1].hits if len(ranked) > 1 else 0
+        return leader.confident_hits >= EARLY_EXIT_MATCHES and leader.hits > runner_up_hits
+
+    def finish(self, save_dir: Path) -> Optional[Dict]:
+        """Save images for the winning plate and return its details, or None if nothing was read."""
+        ranked = self._ranked()
+        if not ranked:
+            logger.info("No valid plates detected - saving first and last frames for debugging")
+            debug_frames = [f for f in (self._first_frame, self._last_frame) if f is not None]
+            self.processor._save_debug_frames(debug_frames, save_dir)
+            return None
+
+        best = ranked[0]
+        if len(ranked) > 1:
+            votes = ", ".join(f"{c.text}x{c.hits}" for c in ranked)
+            logger.info(f"Plate votes: {votes}")
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        images_dir = save_dir / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        image_filename = f"{timestamp}_{best.text}.jpg"
+        cv2.imwrite(str(images_dir / image_filename), best.image)
+
+        crop_filename = f"{timestamp}_{best.text}_crop.jpg"
+        if best.crop is not None and best.crop.size:
+            cv2.imwrite(str(images_dir / crop_filename), best.crop)
+
+        return {
+            'plate_number': best.text,
+            'confidence': best.best_confidence,
+            'image_path': f"images/{image_filename}",
+            'plate_crop_path': f"images/{crop_filename}",
+            'box_coordinates': {
+                'xmin': best.bbox.x1,
+                'ymin': best.bbox.y1,
+                'xmax': best.bbox.x2,
+                'ymax': best.bbox.y2
+            },
+            'frame_count': self.frames_seen
+        }

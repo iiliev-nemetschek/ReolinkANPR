@@ -3,6 +3,7 @@
 import asyncio
 import signal
 import time
+from contextlib import aclosing
 from pathlib import Path
 from .logger import logger
 from .config import Config
@@ -38,6 +39,7 @@ class ANPRService:
         self.running = False
         self.last_detection_time = 0
         self.detection_cooldown = 30  # seconds - ignore new detections for 30s after starting a recording
+        self._background_tasks = set()  # keeps fire-and-forget tasks (settings restore) alive
 
     async def start(self):
         """Start the ANPR service."""
@@ -215,7 +217,9 @@ class ANPRService:
                 await asyncio.sleep(5)
 
     async def _handle_vehicle_detection(self):
-        """Handle TCP push event - record and process."""
+        """Handle TCP push event - stream frames from the camera and read the plate."""
+        before_task = None
+        scanning = False
         try:
             # Check cooldown - prevent multiple recordings for same vehicle
             current_time = time.time()
@@ -227,80 +231,92 @@ class ANPRService:
             
             # Update last detection time
             self.last_detection_time = current_time
-            
-            logger.info("Vehicle detected - starting recording with settings")
+            scanning = True
+            started = time.monotonic()
 
-            # Start recording and settings application in parallel
-            if hasattr(self.config, 'before_recording_enabled') and self.config.before_recording_enabled:
-                # Apply settings and start recording at the SAME time
-                settings_task = asyncio.create_task(self.camera.apply_recording_settings('before'))
-                record_task = asyncio.create_task(
-                    self.camera._record_rtsp_and_extract_frames(self.config.recording_duration)
-                )
-                
-                # Wait for both to complete
-                settings_result, frames = await asyncio.gather(settings_task, record_task)
-                
-                if settings_result:
-                    logger.info("✅ Before-recording settings applied during recording")
-                else:
-                    logger.warning("⚠️ Before-recording settings failed (recording still captured)")
+            logger.info("Vehicle detected - scanning RTSP stream")
+
+            # Camera settings change runs alongside the stream; it never blocks plate reading
+            if getattr(self.config, 'before_recording_enabled', False):
+                before_task = asyncio.create_task(self.camera.apply_recording_settings('before'))
+
+            result = await self._scan_stream()
+            logger.info(f"⏱ Scan finished {time.monotonic() - started:.2f}s after detection")
+
+            if result:
+                await self._publish_detection(result)
+                logger.info(f"⏱ Event published {time.monotonic() - started:.2f}s after detection")
             else:
-                # No settings - just record
-                frames = await self.camera._record_rtsp_and_extract_frames(self.config.recording_duration)
-
-            # Restore settings immediately after recording
-            if hasattr(self.config, 'after_recording_enabled') and self.config.after_recording_enabled:
-                logger.info("Restoring after-recording settings...")
-                success = await self.camera.apply_recording_settings('after')
-                if success:
-                    logger.info("✅ After-recording settings restored")
-                else:
-                    logger.warning("⚠️ After-recording settings failed")
-
-            # Process frames
-            if frames:
-                logger.info(f"Processing {len(frames)} frames...")
-                await self._process_detection(frames)
-            else:
-                logger.warning("No frames captured")
+                logger.info("No valid plates found")
 
         except Exception as e:
             logger.error(f"Error handling vehicle detection: {e}")
+        finally:
+            if scanning:
+                self._schedule_settings_restore(before_task)
 
-    async def _process_detection(self, frames: list):
-        """Process vehicle detection frames through ALPR."""
+    async def _scan_stream(self):
+        """Feed live frames to ALPR until a plate is read consistently or the scan window ends."""
+        scan = self.alpr.new_scan()
+        save_dir = Path(self.config.database_path).parent
 
-        try:
-            # Process frames with ALPR
-            save_dir = Path(self.config.database_path).parent
-            result = await asyncio.to_thread(self.alpr.process_frames, frames, save_dir)
+        async with aclosing(self.camera.stream_frames(self.config.recording_duration)) as frames:
+            async for frame in frames:
+                if await asyncio.to_thread(scan.add_frame, frame):
+                    logger.info(f"Stopping early at frame {scan.frames_seen}: plate read consistently")
+                    break
 
-            if result:
-                # Valid plate detected
-                logger.info(
-                    f"Plate recognized: {result['plate_number']} "
-                    f"(confidence: {result['confidence']:.2%})"
-                )
+        logger.info(f"Analyzed {scan.frames_seen} frames")
+        return await asyncio.to_thread(scan.finish, save_dir)
 
-                # Save to database
-                event_id = await self.database.add_event(result)
-                logger.info(f"Event saved to database (ID: {event_id})")
-                
-                # Send notifications (only if it was actually saved, not a duplicate)
-                if event_id:
-                    # Convert relative image path to absolute for notifications
-                    image_path = result.get('image_path')
-                    if image_path:
-                        image_path = str(save_dir / image_path)
-                    
-                    await self.notifier.send_detection(
-                        result['plate_number'],
-                        result['confidence'],
-                        image_path
-                    )
+    def _schedule_settings_restore(self, before_task):
+        """Restore camera settings in the background, after the 'before' change has landed."""
+        if not getattr(self.config, 'after_recording_enabled', False):
+            return
+
+        async def restore():
+            if before_task is not None:
+                if await before_task:
+                    logger.info("✅ Before-recording settings applied")
+                else:
+                    logger.warning("⚠️ Before-recording settings failed")
+
+            logger.info("Restoring after-recording settings...")
+            if await self.camera.apply_recording_settings('after'):
+                logger.info("✅ After-recording settings restored")
             else:
-                logger.info("No valid plates found in frames")
+                logger.warning("⚠️ After-recording settings failed")
+
+        task = asyncio.create_task(restore())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _publish_detection(self, result: dict):
+        """Save a recognized plate and send notifications."""
+        try:
+            save_dir = Path(self.config.database_path).parent
+
+            logger.info(
+                f"Plate recognized: {result['plate_number']} "
+                f"(confidence: {result['confidence']:.2%})"
+            )
+
+            # Save to database
+            event_id = await self.database.add_event(result)
+            logger.info(f"Event saved to database (ID: {event_id})")
+
+            # Send notifications (only if it was actually saved, not a duplicate)
+            if event_id:
+                # Convert relative image path to absolute for notifications
+                image_path = result.get('image_path')
+                if image_path:
+                    image_path = str(save_dir / image_path)
+
+                await self.notifier.send_detection(
+                    result['plate_number'],
+                    result['confidence'],
+                    image_path
+                )
 
         except Exception as e:
             logger.error(f"Error processing detection: {e}")
