@@ -279,18 +279,25 @@ class CameraClient:
         if self._stream_task is None or self._stream_task.done():
             self._stream_task = asyncio.create_task(self._stream_supervisor())
 
+    @staticmethod
+    async def _cancel_task(task: asyncio.Task, timeout: float = 10):
+        """Cancel a background task, but never let a stuck one block the caller (e.g. a config reload)."""
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("A background task did not stop in time; continuing")
+
     async def _stop_ffmpeg(self):
         task, self._stream_task = self._stream_task, None
         if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await self._cancel_task(task)
         self._frames.clear()
 
     async def stop_stream(self):
         task, self._keepalive_task = self._keepalive_task, None
         if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await self._cancel_task(task)
         await self._stop_ffmpeg()
 
     async def _keepalive_loop(self):
@@ -344,7 +351,21 @@ class CameraClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stderr_reader = asyncio.create_task(process.stderr.read())
+        stderr_tail = bytearray()  # Only the end of ffmpeg's error output is kept
+
+        async def drain_stderr():
+            while True:
+                data = await process.stderr.read(4096)
+                if not data:
+                    return
+                stderr_tail.extend(data)
+                del stderr_tail[:-4000]
+
+        async def discard_stdout():
+            while await process.stdout.read(262144):
+                pass
+
+        stderr_reader = asyncio.create_task(drain_stderr())
         buffer = bytearray()
         connected = False
         stalled = False
@@ -373,12 +394,19 @@ class CameraClient:
         finally:
             if process.returncode is None:
                 process.kill()
-            await process.wait()
-            stderr = await stderr_reader
+            # asyncio only reports the process as exited once both pipes hit EOF, and it stops
+            # reading a pipe nobody drains - so keep draining here or wait() can hang forever.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(discard_stdout(), stderr_reader, process.wait(), return_exceptions=True),
+                    timeout=5
+                )
+            except asyncio.TimeoutError:
+                logger.warning("ffmpeg did not exit cleanly after being stopped")
 
         if stalled:
             return f"no data for {STREAM_STALL_TIMEOUT}s"
-        return self._mask_credentials(stderr.decode(errors='replace').strip())
+        return self._mask_credentials(stderr_tail.decode(errors='replace').strip())
 
     async def stream_frames(self, duration_seconds: float) -> AsyncIterator[bytes]:
         """Yield frames for one scan.
